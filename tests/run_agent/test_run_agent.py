@@ -4300,30 +4300,109 @@ class TestRunConversation:
         assert hook_events[0]["retryable"] is False
         assert hook_events[0]["reason"] == FailoverReason.content_policy_blocked.value
 
-    def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
+    def test_ollama_small_runtime_context_blocks_tool_execution(self, agent, caplog):
+        # Guard is now deferred to the tool-execution path: plain chat succeeds,
+        # but a response that asks for tool calls is intercepted before dispatch.
         self._setup_agent(agent)
         agent.model = "qwen3.5:9b"
         agent.provider = "custom"
         agent.base_url = "http://host.docker.internal:11434/v1"
         agent._ollama_num_ctx = 4096
 
+        # API is called (plain chat was allowed through); it returns a tool call.
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        agent.client.chat.completions.create.return_value = resp
+
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_tool_calls") as mock_exec,
             caplog.at_level(logging.WARNING, logger="agent.conversation_loop"),
         ):
             result = agent.run_conversation("Call ps -aux")
 
         assert result["failed"] is True
         assert result["completed"] is False
-        assert result["api_calls"] == 0
+        assert result["api_calls"] == 1  # API call was made; tool execution was blocked
         assert result["turn_exit_reason"] == "ollama_runtime_context_too_small"
         assert "Ollama loaded `qwen3.5:9b` with only 4,096 tokens" in result["final_response"]
         assert "model.ollama_num_ctx: 65536" in result["final_response"]
-        assert not agent.client.chat.completions.create.called
+        assert agent.client.chat.completions.create.call_count == 1
+        assert not mock_exec.called  # guard fired before _execute_tool_calls
         assert "Ollama runtime context too small for Hermes tool use" in caplog.text
         assert "runtime_context=4096" in caplog.text
+
+    def test_plain_chat_succeeds_with_small_ollama_context(self, agent):
+        """Plain conversational response must not be blocked by the context guard.
+
+        The guard is now deferred to the tool-execution path, so a finish_reason
+        of 'stop' (no tool calls) must succeed regardless of _ollama_num_ctx.
+        """
+        self._setup_agent(agent)
+        agent._ollama_num_ctx = 4096  # well below MINIMUM_CONTEXT_LENGTH
+        resp = _mock_response(content="Hello!", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_tool_calls") as mock_exec,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["failed"] is False
+        assert result["api_calls"] == 1
+        assert "Hello!" in result["final_response"]
+        assert not mock_exec.called  # no tool calls — guard path never entered
+
+    def test_ollama_adequate_context_allows_tool_execution(self, agent):
+        """When runtime context meets the minimum, the guard does not fire and
+        tool execution proceeds normally."""
+        self._setup_agent(agent)
+        agent._ollama_num_ctx = 65536  # >= MINIMUM_CONTEXT_LENGTH
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_tool_calls") as mock_exec,
+        ):
+            result = agent.run_conversation("search for something")
+
+        assert result["completed"] is True
+        assert result["failed"] is False
+        assert mock_exec.called  # guard did not fire; tool execution proceeded
+
+    def test_ollama_context_guard_not_triggered_without_tools(self, agent):
+        """Guard is a no-op when the agent has no registered tools.
+
+        _ollama_context_limit_error returns None immediately when agent.tools
+        is empty, so even a tiny context with no tools should not block chat.
+        """
+        self._setup_agent(agent)
+        agent._ollama_num_ctx = 100  # absurdly small
+        agent.tools = []             # no tools → guard short-circuits
+        resp = _mock_response(content="Hi!", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["failed"] is False
+        assert result.get("turn_exit_reason") != "ollama_runtime_context_too_small"
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

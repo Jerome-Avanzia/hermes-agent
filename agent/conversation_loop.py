@@ -1574,23 +1574,6 @@ def run_conversation(
         )
         total_chars = approx_tokens * 4
 
-        _runtime_context_error = _ollama_context_limit_error(
-            agent, request_pressure_tokens
-        )
-        if _runtime_context_error:
-            final_response = _runtime_context_error
-            failed = True
-            _turn_exit_reason = "ollama_runtime_context_too_small"
-            messages.append({"role": "assistant", "content": final_response})
-            agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
-            api_call_count -= 1
-            agent._api_call_count = api_call_count
-            try:
-                agent.iteration_budget.refund()
-            except Exception:
-                pass
-            break
-
         # Pre-API pressure check. The turn-prologue preflight only saw the
         # incoming user message; a single turn can then grow by many large
         # tool results and leave no output budget before the NEXT call (the
@@ -5789,6 +5772,25 @@ def run_conversation(
                         agent.stream_delta_callback(None)
                     except Exception:
                         pass
+
+                # Ollama runtime context guard — plain chat was allowed through
+                # above; block tool execution here when the runtime context is
+                # too small to run tool-calling workflows reliably.  The check
+                # is deferred to this point (rather than the turn prologue) so
+                # that conversational responses that do not involve tool calls
+                # succeed at any context size.
+                _runtime_context_error = _ollama_context_limit_error(
+                    agent, request_pressure_tokens
+                )
+                if _runtime_context_error:
+                    final_response = _runtime_context_error
+                    failed = True
+                    _turn_exit_reason = "ollama_runtime_context_too_small"
+                    messages.append({"role": "assistant", "content": final_response})
+                    agent._emit_status(
+                        "❌ Ollama runtime context is too small for Hermes tool use"
+                    )
+                    break
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
