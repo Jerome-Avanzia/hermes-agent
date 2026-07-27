@@ -1554,6 +1554,9 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
+                    _pt_agent = getattr(agent, "_pipeline_timing", None)
+                    if _pt_agent is not None:
+                        _pt_agent.mark("first_token")
 
                 _use_streaming = True
                 # Provider signaled "stream not supported" on a previous
@@ -1614,6 +1617,9 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                _pipeline_timing = getattr(agent, "_pipeline_timing", None)
+                if _pipeline_timing is not None:
+                    _pipeline_timing.mark("http_start")
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -1658,7 +1664,9 @@ def run_conversation(
                     else:
                         interrupted = True
                     break
-                
+
+                if _pipeline_timing is not None:
+                    _pipeline_timing.mark("http_done")
                 api_duration = time.time() - api_start_time
                 
                 # Stop thinking spinner silently -- the response box or tool

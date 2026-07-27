@@ -94,6 +94,109 @@ from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Pipeline timing instrumentation
+# ---------------------------------------------------------------------------
+# Named under the module's own logger hierarchy so records propagate through
+# the same root-logger handlers (agent.log, gateway.log) that already receive
+# all gateway.* traffic.  No custom handler is needed — propagation to root is
+# sufficient.  Records are emitted at INFO so the existing INFO-level
+# RotatingFileHandlers accept them without any level reconfiguration.
+#
+# Enable:  HERMES_TIMING_LOG=1  (set before starting the server)
+# Disable: unset / any other value (default — zero overhead, no log lines)
+# grep:    grep '\[timing\]' ~/.hermes/logs/gateway.log
+# ---------------------------------------------------------------------------
+_timing_logger = logging.getLogger("gateway.platforms.api_server.timing")
+_TIMING_ENABLED: bool = os.environ.get("HERMES_TIMING_LOG", "").strip() == "1"
+
+
+class _PipelineTiming:
+    """Accumulate wall-clock timestamps for one conversation request.
+
+    Thread-safe under CPython's GIL: ``first_token_seen`` is written from
+    the agent executor thread and read from the async event loop — the boolean
+    flip is atomic in CPython so no explicit lock is needed.  ``_marks`` is
+    written from both the async loop and the executor thread; dict assignment
+    is atomic in CPython so no explicit lock is needed there either.
+    """
+    __slots__ = ("session_id", "request_id", "t0", "first_token_seen", "_marks")
+
+    def __init__(self, session_id: str, request_id: str) -> None:
+        self.session_id = session_id
+        self.request_id = request_id
+        self.t0 = time.monotonic()
+        self.first_token_seen: bool = False
+        self._marks: dict = {}
+
+    def log(self, stage: str) -> None:
+        if not _TIMING_ENABLED:
+            return
+        elapsed_ms = int((time.monotonic() - self.t0) * 1000)
+        _timing_logger.info(
+            "[timing] session=%s request=%s stage=%s elapsed_ms=%d",
+            self.session_id,
+            self.request_id,
+            stage,
+            elapsed_ms,
+        )
+
+    def mark(self, name: str) -> None:
+        """Record a named timestamp (not emitted immediately).
+
+        Called from both the async event loop and the executor thread.
+        Dict key assignment is atomic under CPython's GIL.
+        """
+        self._marks[name] = time.monotonic()
+
+    def dump_table(self) -> None:
+        """Emit a wall-clock breakdown table to identify the slow stage.
+
+        Stages logged:
+          Executor queue wait   — asyncio → thread pool dispatch lag
+          Agent creation        — _create_agent() inside the thread
+          Build request         — _build_api_kwargs + middleware + hooks
+          Provider HTTP total   — entire HTTP round-trip (connect + think + stream)
+            ↳ Think / TTFT      — connect + provider think time until first token
+            ↳ Stream generation — first token to last token
+          Post-processing       — conversation loop after HTTP (tool exec, retries, etc.)
+          Result assembly       — usage/session_id collection after run_conversation
+        """
+        if not _TIMING_ENABLED:
+            return
+        m = self._marks
+        t0 = self.t0
+
+        def _ms(a: str, b: str) -> str:
+            ta = m.get(a)
+            tb = m.get(b)
+            if ta is None or tb is None:
+                return "     ?"
+            return f"{int((tb - ta) * 1000):>7,}"
+
+        rows = [
+            ("Executor queue wait",    "run_agent_called",  "thread_started"),
+            ("Agent creation",         "thread_started",    "agent_created"),
+            ("Build request",          "agent_created",     "http_start"),
+            ("Provider HTTP total",    "http_start",        "http_done"),
+            ("  Think / TTFT",         "http_start",        "first_token"),
+            ("  Stream generation",    "first_token",       "http_done"),
+            ("Post-processing",        "http_done",         "conversation_done"),
+            ("Result assembly",        "conversation_done", "thread_done"),
+        ]
+        sep = "  " + "-" * 47
+        _timing_logger.info(
+            "[timing-table] session=%s request=%s",
+            self.session_id, self.request_id,
+        )
+        _timing_logger.info("  %-33s  %s", "Stage", "Duration (ms)")
+        _timing_logger.info("%s", sep)
+        for label, a, b in rows:
+            _timing_logger.info("  %-33s  %s ms", label, _ms(a, b))
+        _timing_logger.info("%s", sep)
+        total = _ms("run_agent_called", "thread_done")
+        _timing_logger.info("  %-33s  %s ms", "TOTAL (run_agent wall clock)", total)
+
 
 def _hermes_version() -> str:
     """Return the canonical Hermes Agent version string.
@@ -2598,6 +2701,9 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
+        _pt = _PipelineTiming(session_id=session_id, request_id=f"scs_{uuid.uuid4().hex[:12]}")
+        _pt.log("USER_SUBMIT")
+        _pt.log("SESSION_CREATED")
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -2607,6 +2713,7 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        _pt.log("PROMPT_SERIALIZED")
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -2639,6 +2746,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _delta(delta: str) -> None:
             if delta:
+                if not _pt.first_token_seen:
+                    _pt.first_token_seen = True
+                    _pt.log("FIRST_TOKEN_RECEIVED")
                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
@@ -2653,6 +2763,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = await self._conversation_history_for_session(session_id)
+                _pt.log("REQUEST_SENT_TO_HERMES")
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -2661,7 +2772,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    timing=_pt,
                 )
+                _pt.log("LAST_TOKEN_RECEIVED")
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
@@ -2725,6 +2838,8 @@ class APIServerAdapter(BasePlatformAdapter):
             raise
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
+        _pt.log("STREAM_SENT_TO_BROWSER")
+        _pt.log("REQUEST_COMPLETE")
         return response
 
     @_admit_api_agent_request
@@ -2740,6 +2855,9 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        _pt = _PipelineTiming(session_id="(pending)", request_id=f"cc_{uuid.uuid4().hex[:12]}")
+        _pt.log("USER_SUBMIT")
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -2784,6 +2902,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
             )
+        _pt.log("PROMPT_SERIALIZED")
 
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
@@ -2840,6 +2959,8 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
+            _pt.session_id = session_id
+            _pt.log("SESSION_CREATED")
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -2852,6 +2973,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+            _pt.session_id = session_id
+            _pt.log("SESSION_CREATED")
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -2875,6 +2998,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # the final answer after tool calls.  The SSE loop detects
                 # completion via agent_task.done() instead.
                 if delta is not None:
+                    if not _pt.first_token_seen:
+                        _pt.first_token_seen = True
+                        _pt.log("FIRST_TOKEN_RECEIVED")
                     _stream_q.put(delta)
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
@@ -2934,6 +3060,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            _pt.log("REQUEST_SENT_TO_HERMES")
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2945,6 +3072,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                timing=_pt,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2954,9 +3082,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                timing=_pt,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
+        _pt.log("REQUEST_SENT_TO_HERMES")
+
         async def _compute_completion():
             return await self._run_agent(
                 user_message=user_message,
@@ -2965,6 +3096,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                timing=_pt,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3066,12 +3198,14 @@ class APIServerAdapter(BasePlatformAdapter):
             if err_msg:
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
 
+        _pt.log("REQUEST_COMPLETE")
         return web.json_response(response_data, headers=response_headers)
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        timing: "_PipelineTiming | None" = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -3159,6 +3293,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     continue
 
                 if delta is None:  # End of stream sentinel
+                    if timing is not None:
+                        timing.log("LAST_TOKEN_RECEIVED")
                     break
 
                 last_activity = await _emit(delta)
@@ -3228,6 +3364,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
+            if timing is not None:
+                timing.log("STREAM_SENT_TO_BROWSER")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
             # stops making LLM API calls at the next loop iteration, then
@@ -3262,6 +3400,8 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        if timing is not None:
+            timing.log("REQUEST_COMPLETE")
         return response
 
     async def _write_sse_responses(
@@ -4748,6 +4888,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        timing: "Optional[_PipelineTiming]" = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4773,6 +4914,8 @@ class APIServerAdapter(BasePlatformAdapter):
         def _run():
             from gateway.session_context import clear_session_vars
 
+            if timing is not None:
+                timing.mark("thread_started")
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
@@ -4790,6 +4933,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         route=route,
                     )
+                    if timing is not None:
+                        timing.mark("agent_created")
+                        # Wire the timing object so conversation_loop.py can
+                        # record http_start / first_token / http_done marks.
+                        agent._pipeline_timing = timing
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
@@ -4798,6 +4946,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
+                    if timing is not None:
+                        timing.mark("conversation_done")
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -4823,8 +4973,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         result["_compressed"] = True
                     return result, usage
                 finally:
+                    if timing is not None:
+                        timing.mark("thread_done")
+                        timing.dump_table()
                     clear_session_vars(tokens)
 
+        if timing is not None:
+            timing.mark("run_agent_called")
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
