@@ -39,6 +39,18 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
+
+def _probe(msg: str) -> None:
+    """Write directly to /tmp/hermes_probe.log — bypasses all logging."""
+    try:
+        with open("/tmp/hermes_probe.log", "a") as _f:
+            _f.write(f"{time.monotonic():.3f} pid={os.getpid()} tid={threading.get_ident()} {msg}\n")
+    except Exception:
+        pass
+
+
+_probe(f"[IMPORT] tui_gateway/server.py imported from {__file__}")
+
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
@@ -5183,6 +5195,7 @@ def _make_agent(
     service_tier_override: str | None = None,
     platform_override: str | None = None,
 ):
+    _probe(f"[REQUEST] tui_gateway._make_agent() called sid={sid} session_id={session_id}")
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
     # leaving the process boundary as the only experimental variable.

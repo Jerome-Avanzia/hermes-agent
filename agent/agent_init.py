@@ -59,6 +59,24 @@ from utils import base_url_host_matches, is_truthy_value
 # from inside that module.)
 logger = logging.getLogger("run_agent")
 
+# ---------------------------------------------------------------------------
+# Deployment probe — write directly to a file on module import and on each
+# init_agent() call.  Uses open() so it fires regardless of whether
+# setup_logging() has run, and regardless of any logging configuration.
+# Confirms: (1) this source file is actually being imported by the running
+# process, and (2) init_agent() is reached per request.
+# grep the probe file: tail -f /tmp/hermes_probe.log
+# ---------------------------------------------------------------------------
+def _probe(msg: str) -> None:
+    try:
+        with open("/tmp/hermes_probe.log", "a") as _f:
+            _f.write(f"{time.monotonic():.3f} pid={os.getpid()} tid={threading.get_ident()} {msg}\n")
+    except Exception:
+        pass
+
+
+_probe(f"[IMPORT] agent/agent_init.py imported from {__file__}")
+
 
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
@@ -407,6 +425,47 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+class _InitTimer:
+    """Lightweight monotonic timer for tracing init_agent() sub-stages.
+
+    Records named checkpoints and emits a breakdown table to
+    ``hermes.init_timing`` logger (INFO) at the end.  Propagates through
+    the root logger so it appears in agent.log without any env-var gate.
+    grep: ``[init_timing]``
+    """
+    _log = logging.getLogger("hermes.init_timing")
+
+    def __init__(self, session_id: str) -> None:
+        self._t0 = time.monotonic()
+        self._prev = self._t0
+        self._session_id = session_id
+        self._thread_id = threading.get_ident()
+        self._marks: list = []  # (name, abs_time)
+        self._emit("AGENT_INITIALIZATION_BEGIN")
+
+    def _emit(self, stage: str) -> None:
+        now = time.monotonic()
+        elapsed_ms = int((now - self._t0) * 1000)
+        step_ms = int((now - self._prev) * 1000)
+        self._prev = now
+        self._marks.append((stage, now))
+        self._log.info(
+            "[init_timing] session=%s thread=%d stage=%-40s elapsed_ms=%7d step_ms=%7d",
+            self._session_id, self._thread_id, stage, elapsed_ms, step_ms,
+        )
+
+    def mark(self, stage: str) -> None:
+        self._emit(stage)
+
+    def finish(self) -> None:
+        self._emit("AGENT_INITIALIZATION_END")
+        total_ms = int((time.monotonic() - self._t0) * 1000)
+        self._log.info(
+            "[init_timing] session=%s thread=%d TOTAL_INIT_MS=%d",
+            self._session_id, self._thread_id, total_ms,
+        )
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -531,6 +590,11 @@ def init_agent(
             remain skipped.
     """
     _install_safe_stdio()
+
+    _probe(f"[REQUEST] init_agent() called session={session_id or ''} platform={platform or ''}")
+
+    # Timing tracer — always-on, no env-var gate.  grep: [init_timing]
+    _itimer = _InitTimer(session_id or "")
 
     agent.model = model
     agent.max_iterations = max_iterations
@@ -847,6 +911,7 @@ def init_agent(
     # (which creates a new AIAgent per message) won't duplicate handlers.
     from hermes_logging import setup_logging, setup_verbose_logging
     setup_logging(hermes_home=_ra()._hermes_home)
+    _itimer.mark("SETUP_LOGGING_DONE")
 
     if agent.verbose_logging:
         setup_verbose_logging()
@@ -1360,12 +1425,14 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    _itimer.mark("GET_TOOL_DEFINITIONS_BEGIN")
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
-    
+    _itimer.mark("GET_TOOL_DEFINITIONS_END")
+
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:
@@ -1583,6 +1650,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    _itimer.mark("MEMORY_INIT_BEGIN")
     if not skip_memory or _memory_toolset_requested:
         try:
             mem_config = _agent_cfg.get("memory", {})
@@ -1671,6 +1739,7 @@ def init_agent(
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
+    _itimer.mark("MEMORY_INIT_END")
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
@@ -2190,6 +2259,7 @@ def init_agent(
 
 
 
+    _itimer.mark("CONTEXT_ENGINE_BEGIN")
     # Select context engine: config-driven (like memory providers).
     # 1. Check config.yaml context.engine setting
     # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
@@ -2566,6 +2636,9 @@ def init_agent(
     # preferred model gets a fresh attempt each time.  Uses a single dict
     # so new state fields are easy to add without N individual attributes.
     _cc = agent.context_compressor
+    _itimer.mark("CONTEXT_BUILD_END")
+    _itimer.finish()
+
     agent._primary_runtime = {
         "model": agent.model,
         "provider": agent.provider,
