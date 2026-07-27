@@ -105,7 +105,7 @@ class _OpenAIProxy:
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
-from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, detect_local_server_type, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
@@ -6778,6 +6778,8 @@ def _build_call_kwargs(
             merged_extra["reasoning"] = {"enabled": True, "effort": effort}
     if provider == "nous" and "tags" not in merged_extra:
         merged_extra["tags"] = _nous_portal_tags()
+    if effective_base and detect_local_server_type(effective_base) == "ollama":
+        merged_extra.setdefault("think", False)
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 

@@ -275,6 +275,73 @@ class TestResolveTaskProviderModel:
         assert api_key == "explicit-key"
 
 
+class TestBuildCallKwargsOllamaThink:
+    """_build_call_kwargs injects think=False into extra_body for Ollama endpoints."""
+
+    def _ollama_kwargs(self, base_url="http://localhost:11434/v1", extra_body=None):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        return _build_call_kwargs(
+            provider="custom",
+            model="qwen3:30b",
+            messages=[{"role": "user", "content": "hi"}],
+            base_url=base_url,
+            extra_body=extra_body,
+        )
+
+    def test_injects_think_false_for_ollama(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client.detect_local_server_type",
+            lambda url, **kw: "ollama",
+        )
+        kwargs = self._ollama_kwargs()
+        assert kwargs["extra_body"]["think"] is False
+
+    def test_existing_extra_body_fields_survive(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client.detect_local_server_type",
+            lambda url, **kw: "ollama",
+        )
+        kwargs = self._ollama_kwargs(extra_body={"foo": "bar"})
+        assert kwargs["extra_body"]["foo"] == "bar"
+        assert kwargs["extra_body"]["think"] is False
+
+    def test_explicit_think_true_not_overwritten(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client.detect_local_server_type",
+            lambda url, **kw: "ollama",
+        )
+        kwargs = self._ollama_kwargs(extra_body={"think": True})
+        assert kwargs["extra_body"]["think"] is True
+
+    @pytest.mark.parametrize(
+        "server_type",
+        [None, "lm-studio", "vllm", "llamacpp"],
+    )
+    def test_no_think_injected_for_non_ollama(self, monkeypatch, server_type):
+        monkeypatch.setattr(
+            "agent.auxiliary_client.detect_local_server_type",
+            lambda url, **kw: server_type,
+        )
+        kwargs = self._ollama_kwargs(base_url="http://localhost:1234/v1")
+        assert "think" not in (kwargs.get("extra_body") or {})
+
+    def test_no_think_injected_for_openai(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client.detect_local_server_type",
+            lambda url, **kw: None,
+        )
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="openai",
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            base_url="https://api.openai.com/v1",
+        )
+        assert "think" not in (kwargs.get("extra_body") or {})
+
+
 class TestBuildCallKwargsMaxTokens:
     """_build_call_kwargs should not cap output by default (#34530).
 
