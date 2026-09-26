@@ -14,6 +14,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from rich.markup import escape as _escape
@@ -46,8 +47,12 @@ class CLIAgentSetupMixin:
         except Exception as exc:
             _primary_exc = exc
 
+        # An explicitly pinned Kanban task is fail-closed:
+        # never switch to an unapproved fallback provider.
+        _kanban_pinned_model = os.getenv("HERMES_KANBAN_PINNED_MODEL") == "1"
+
         # Primary provider auth failed — try fallback providers before giving up.
-        if runtime is None and _primary_exc is not None:
+        if runtime is None and _primary_exc is not None and not _kanban_pinned_model:
             from hermes_cli.auth import AuthError
             if isinstance(_primary_exc, AuthError):
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
@@ -384,7 +389,7 @@ class CLIAgentSetupMixin:
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
 
-                fallback_model=self._fallback_model,
+                fallback_model=None if os.getenv("HERMES_KANBAN_PINNED_MODEL") == "1" else self._fallback_model,
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,

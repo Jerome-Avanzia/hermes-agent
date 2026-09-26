@@ -1140,7 +1140,17 @@ def _handle_create(args: dict, **kw) -> str:
                     _self_task = kb.get_task(conn, _self_tid)
                     if _self_task is not None and _self_task.workspace_kind:
                         workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
+                        # Only inherit the parent's workspace_path for
+                        # persistent workspace kinds. Scratch workspaces are
+                        # per-task and auto-deleted on completion; copying
+                        # the parent's scratch path makes children share the
+                        # parent's workspace, breaking isolation and causing
+                        # cleanup to target the wrong directory. For scratch
+                        # children, leave workspace_path unset so the
+                        # dispatcher resolves a fresh <workspaces_root>/<task_id>
+                        # directory at spawn time.
+                        if _self_task.workspace_kind != "scratch":
+                            workspace_path = _self_task.workspace_path
                         # Keep follow-up children inside the same project so the
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:

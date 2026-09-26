@@ -8639,6 +8639,10 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # Explicit model + provider pin is an autonomous safety boundary:
+    # the worker must not fall back to another provider.
+    if task.model_override and task.provider_override:
+        env["HERMES_KANBAN_PINNED_MODEL"] = "1"
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
